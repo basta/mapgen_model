@@ -2,10 +2,11 @@
 Preprocess raw GeoTIFF tiles into (sparse_label, heightmap) training pairs.
 
 For each tile:
-  1. Normalize elevation to [0, 1] (per-tile min/max)
+  1. Normalize elevation to [0, 1] using a fixed global range [ELEV_MIN, ELEV_MAX]
+     so that sea level, mountain height, etc. are consistent across all tiles.
   2. Slice into 256×256 patches with stride 128
-  3. Filter patches with relief < MIN_RELIEF_M (too flat to be useful)
-  4. Derive full label map: ocean / mountain / river / forest
+  3. Filter patches with relief < MIN_RELIEF_M metres (too flat to be useful)
+  4. Derive full label map using absolute elevation thresholds (metres)
   5. Sparsify labels to a random keep_ratio in [MIN_KEEP, MAX_KEEP]
   6. Save pair as data/processed/{split}/{idx:06d}_{label|height}.npy
 
@@ -29,15 +30,29 @@ import rasterio
 from pathlib import Path
 from scipy.ndimage import maximum_filter, binary_dilation, uniform_filter
 from pysheds.grid import Grid
+from tqdm import tqdm
 
 RAW_DIR   = Path("data/raw")
 OUT_DIR   = Path("data/processed")
 PATCH_SIZE  = 256
 STRIDE      = 128
-MIN_RELIEF  = 0.20   # fraction of normalized range; ~200m on high-relief tiles
 VAL_RATIO   = 0.10   # 10% of tiles held out for validation
 MIN_KEEP    = 0.01   # minimum label sparsity
 MAX_KEEP    = 0.20   # maximum label sparsity
+
+# Global elevation range (metres) — fixed across all tiles so the model sees
+# consistent absolute heights. Covers our target regions with headroom.
+ELEV_MIN = -500.0
+ELEV_MAX = 5000.0
+
+# Label thresholds in metres
+OCEAN_MAX_M    =    10.0   # below sea level / tidal zone
+MOUNTAIN_MIN_M =  1800.0   # true alpine terrain
+FOREST_LOW_M   =   100.0   # above floodplain
+FOREST_HIGH_M  =  1600.0   # below treeline
+
+# Minimum patch relief in metres to filter out flat/boring tiles
+MIN_RELIEF_M = 200.0
 
 # Label RGB values — must match frontend brush colors
 LABEL_COLORS = {
@@ -52,10 +67,13 @@ LABEL_COLORS = {
 # loading
 # ---------------------------------------------------------------------------
 
-def load_tile(path: Path) -> tuple[np.ndarray, float]:
+def load_tile(path: Path) -> tuple[np.ndarray, np.ndarray, float]:
     """
-    Load a GeoTIFF and return (normalized_heightmap, nodata_fraction).
-    Normalization is per-tile min/max so the model sees full dynamic range.
+    Load a GeoTIFF and return (elev_metres, normalized_heightmap, nodata_fraction).
+
+    elev_metres   — raw elevation values in metres (for label derivation)
+    normalized    — elevation mapped to [0,1] using the global ELEV_MIN/ELEV_MAX
+                    so that height is comparable across all tiles
     """
     with rasterio.open(path) as src:
         dem = src.read(1).astype(np.float32)
@@ -64,13 +82,13 @@ def load_tile(path: Path) -> tuple[np.ndarray, float]:
     if nodata is not None:
         invalid = dem == nodata
         dem[invalid] = np.nan
-        nodata_frac = invalid.mean()
+        nodata_frac = float(invalid.mean())
     else:
         nodata_frac = 0.0
 
-    lo, hi = np.nanmin(dem), np.nanmax(dem)
-    norm = (dem - lo) / (hi - lo + 1e-6)
-    return norm, nodata_frac
+    norm = np.clip((dem - ELEV_MIN) / (ELEV_MAX - ELEV_MIN), 0.0, 1.0)
+    norm[np.isnan(dem)] = np.nan
+    return dem, norm, nodata_frac
 
 
 # ---------------------------------------------------------------------------
@@ -104,24 +122,24 @@ def derive_rivers(path: Path, shape: tuple) -> np.ndarray:
         return None  # caller will use fallback
 
 
-def derive_labels(h: np.ndarray, river_mask: np.ndarray | None = None) -> np.ndarray:
+def derive_labels(elev_m: np.ndarray, river_mask: np.ndarray | None = None) -> np.ndarray:
     """
-    Derive a full RGB label map from a normalized heightmap patch.
+    Derive a full RGB label map from raw elevation in metres.
+    Thresholds are absolute so labels are consistent across all tiles.
     Priority (highest wins): mountain > river > ocean > forest
     """
-    rgb = np.zeros((*h.shape, 3), dtype=np.uint8)
+    rgb = np.zeros((*elev_m.shape, 3), dtype=np.uint8)
 
-    ocean    = h < 0.30
-    peaks    = (h > 0.75) & (h == maximum_filter(h, size=15))
-    mountain = binary_dilation(peaks, iterations=6)
-    forest   = (~ocean) & (~mountain) & (h > 0.32) & (h < 0.70)
+    ocean    = elev_m < OCEAN_MAX_M
+    mountain = elev_m > MOUNTAIN_MIN_M
+    forest   = (~ocean) & (~mountain) & (elev_m > FOREST_LOW_M) & (elev_m < FOREST_HIGH_M)
 
     if river_mask is not None:
         river = river_mask & (~ocean) & (~mountain)
     else:
-        # fallback: pixels that sit below their local neighborhood mean
-        smoothed = uniform_filter(h, size=7)
-        river = (~ocean) & (~mountain) & ((h - smoothed) < -0.012)
+        # fallback: channels sit below their local neighbourhood mean
+        smoothed = uniform_filter(elev_m, size=7)
+        river = (~ocean) & (~mountain) & ((elev_m - smoothed) < -5.0)
 
     # paint in priority order (last wins for overlaps)
     rgb[forest]   = LABEL_COLORS["forest"]
@@ -135,19 +153,20 @@ def derive_labels(h: np.ndarray, river_mask: np.ndarray | None = None) -> np.nda
 # patching + sparsification
 # ---------------------------------------------------------------------------
 
-def extract_patches(h: np.ndarray, labels: np.ndarray,
+def extract_patches(norm: np.ndarray, elev_m: np.ndarray, labels: np.ndarray,
                     rng: np.random.Generator) -> list[tuple[np.ndarray, np.ndarray]]:
     """Slice tile into overlapping 256×256 patches, filter flat ones."""
-    H, W = h.shape
+    H, W = norm.shape
     pairs = []
     for r in range(0, H - PATCH_SIZE + 1, STRIDE):
         for c in range(0, W - PATCH_SIZE + 1, STRIDE):
-            hp = h[r:r+PATCH_SIZE, c:c+PATCH_SIZE]
-            if np.isnan(hp).mean() > 0.05:
+            ep = elev_m[r:r+PATCH_SIZE, c:c+PATCH_SIZE]
+            if np.isnan(ep).mean() > 0.05:
                 continue  # too much nodata
-            relief = float(np.nanmax(hp) - np.nanmin(hp))
-            if relief < MIN_RELIEF:
+            relief_m = float(np.nanmax(ep) - np.nanmin(ep))
+            if relief_m < MIN_RELIEF_M:
                 continue  # too flat
+            hp = norm[r:r+PATCH_SIZE, c:c+PATCH_SIZE]
             lp = labels[r:r+PATCH_SIZE, c:c+PATCH_SIZE]
             pairs.append((hp, lp))
     return pairs
@@ -186,18 +205,19 @@ def main(limit: int | None = None):
     counters = {"train": 0, "val": 0}
     total_patches = 0
 
-    for tile_idx, tile_path in enumerate(tiles):
+    tile_bar = tqdm(tiles, unit="tile", dynamic_ncols=True)
+    for tile_path in tile_bar:
         split = "val" if tile_path.name in val_set else "train"
-        print(f"[{tile_idx+1}/{len(tiles)}] {tile_path.name} → {split}", end="  ", flush=True)
+        tile_bar.set_description(tile_path.stem[-30:])
 
-        h, nodata_frac = load_tile(tile_path)
+        elev_m, norm, nodata_frac = load_tile(tile_path)
         if nodata_frac > 0.5:
-            print(f"skip (nodata={nodata_frac:.0%})")
+            tile_bar.write(f"skip {tile_path.name} (nodata={nodata_frac:.0%})")
             continue
 
-        river_mask = derive_rivers(tile_path, h.shape)
-        labels = derive_labels(h, river_mask)
-        pairs = extract_patches(h, labels, rng)
+        river_mask = derive_rivers(tile_path, elev_m.shape)
+        labels = derive_labels(elev_m, river_mask)
+        pairs = extract_patches(norm, elev_m, labels, rng)
 
         out_subdir = OUT_DIR / split
         for hp, lp in pairs:
@@ -210,11 +230,11 @@ def main(limit: int | None = None):
             total_patches += 1
 
             if limit and total_patches >= limit:
-                print(f"\nReached limit of {limit} patches.")
+                tile_bar.write(f"Reached limit of {limit} patches.")
                 _print_summary(counters, OUT_DIR)
                 return
 
-        print(f"{len(pairs)} patches")
+        tile_bar.set_postfix(patches=total_patches, split=split)
 
     _print_summary(counters, OUT_DIR)
 
